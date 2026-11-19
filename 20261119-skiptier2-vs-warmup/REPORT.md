@@ -28,8 +28,16 @@ warm-up" or "the startup warm-up" means the mechanism: the self-traffic the API 
     reached C2 only inlined into callers. Eager compilation never takes these past level 2.
   - **D. Dependencies initialized by the first real requests (103 methods).** These work as designed, but only
     once traffic has started. The source shows that initializing those classes is enough; the methods don't
-    need to be called until they're hot. So explicitly initializing them during the idle period should fix D
-    (section 4, untested).
+    need to be called until they're hot.
+- **D is fixed by eager class initialization (confirmed).** `skip` now initializes every loaded class during
+  its idle period: 8,298 classes in about 27 s, none failing.
+  - At C2 before traffic: 76 of the 103 D methods per run, up from 4.
+  - First-time C2 compiles during traffic: 26 per run, down from 94.
+  - All C2 compiles during traffic: 211 per run, down from 304.
+- **B and C are now the bottleneck.** Only 7 of 78 B methods and 27 of 170 C methods reach C2 before traffic.
+  - Their level-2 → C2 upgrades (163 per run) make up most of the C2 work that remains in the burst: 0.32 of
+    the CPU for 8 s, against `warm`'s 0.03.
+  - `skip` still failed 2 of 3 runs, falling into overload.
 - **Preloaded is not initialized.**
   - The AOT cache loads and links every cached class at startup, including the request-path classes.
   - JIT dependencies wait for class initialization, which runs a class's static initializer at its first use.
@@ -216,10 +224,10 @@ Evidence for each cause:
   traffic, nothing initializes the request-path classes, so code that assumes they're initialized can't be
   installed.
 
-### Suggested fix for D: initialize the classes during the idle period
+### Fix for D: initialize the classes during the idle period
 
-Untested. To fix D, the dependency classes only need to be initialized; the methods don't need to be called until
-they're hot. When the last class a compile record depends on finishes initializing, HotSpot queues that C2
+Tested and confirmed in section 5. To fix D, the dependency classes only need to be initialized; the methods don't
+need to be called until they're hot. When the last class a compile record depends on finishes initializing, HotSpot queues that C2
 compile immediately. No invocation counters are involved.
 
 **The trigger path in the source (`jdk-25-ga`):**
@@ -254,11 +262,18 @@ depend on it.
 - **Low traffic was enough for D.** In the instrumented `skip` run, 92 of the 103 D methods reached C2 during the
   functional checks, at far too low a request rate to make them hot.
 
-**The proposal.** During `skip`'s idle period, after startup and before the idle-period GC, explicitly initialize
-the classes that compile records depend on, with `Class.forName(name, true, loader)`. Two ways to get the list:
+**The fix.** During `skip`'s idle period, after startup and before the idle-period GC, explicitly initialize the
+classes that compile records depend on, with `Class.forName(name, true, loader)`. There are three ways to get the
+list:
 - **Targeted:** the classes the `-XX:+AOTPrintTrainingInfo` dump lists as dependencies of C2 compile records. The
   dump can be produced from the cache at build time.
-- **Broad:** every class that was already initialized when training ended.
+- **From training:** every class that was already initialized when training ended.
+- **Every loaded class (what was tested):**
+  - The list comes from the `VM.class_hierarchy` diagnostic command, which the API calls in-process through the
+    `DiagnosticCommand` MBean. With the AOT cache, that's every cached class.
+  - Hidden classes are skipped because they can't be looked up by name.
+  - Classes are initialized in batches of 100, waiting after each batch for the JIT to go quiet.
+  - The setting is `api.warmup.init-classes`; the code is `LoadedClassInitializer`.
 
 Conditions for a method to reach C2 this way:
 1. **All of its dependencies must be initialized,** not only the obvious request classes.
@@ -284,12 +299,15 @@ Conditions for a method to reach C2 this way:
 - **It doesn't help C** (no top-level C2 compile in training). Those methods still need to get hot, so the
   backlog of C methods remains for traffic.
 
-**Expected effect, if it works as the source suggests.** D (103 methods) would reach C2 before traffic, and
-most of what remains of A after fix A would too, if those methods' dependencies are request-path classes. About
-20–40% of the 488-method gap would then be compiled during the idle period instead of the burst. B and C, about
-half the gap, would remain.
+**Measured effect (section 5):**
+- **D:** 76 of its 103 methods reached C2 before traffic, up from 4.
+- **B and C were barely affected,** as expected: B went from 2 to 7 methods, C from 14 to 27.
+- The 27 D methods still missing could have run into B's dropped-upgrade problem, or depend on a class the
+  list didn't cover. This wasn't investigated.
 
-## 5. Follow-up: fixing A, plus a GC during the idle period
+## 5. Follow-up: fixing A and D, plus a GC during the idle period
+
+### Step 1: fix A and the idle-period GC
 
 Two changes, then 4 runs of each branch on a 40k cache retrained with them (experiment depfix-gc):
 - **Fix A:** record the AOT cache with the startup warm-up off. Compile records depending on HttpClient classes
@@ -314,6 +332,57 @@ The GC problem is gone and the compile backlog shrank by about 18%, but C2 still
   0.6 s.
 - **One `skip` run collapsed with no trigger at all.**
 - **The failed `warm` run (60%) failed for an unrelated reason:** Postgres was saturated.
+
+### Step 2: eager class initialization (fixes D)
+
+`skip` additionally initializes every loaded class during its idle period, as described in section 4. The 40k
+cache was retrained for the new build, again with the startup warm-up off. The experiment (initclasses) was
+stopped at 3 runs per branch.
+
+In every `skip` run the initializer handled 8,309 loaded classes in about 27 s:
+- 8,298 initialized;
+- 11 couldn't be found by name;
+- none failed.
+
+All functional checks passed in every run, so running the static initializers early broke nothing here.
+
+| `skip`, mean per run | Step 1 (4 runs) | Step 2 (3 runs) |
+|---|---|---|
+| C2 compiles before traffic | 1,300 | **1,444** |
+| C2 compiles during traffic | 304 | **211** |
+| First-time C2 compiles during traffic | 94 | **26** |
+| Level 2 → C2 upgrades during traffic | 192 | 163 |
+| C2 CPU, first 8 s of the burst | 0.39 | 0.32 |
+| On time | 86.3, 95.8, 9.6, 93.9% | 99.2, 24.3, 63.5% |
+
+For comparison, `warm` did 45 C2 compiles during traffic, used 0.03 of the CPU for C2 and passed all 3 runs
+(99.5, 99.8, 99.9%).
+
+Per cause, these are the methods at C2 before traffic, as a mean per `skip` run. The causes are as classified on
+the earlier cache:
+
+| Cause | Methods | Step 1 | Step 2 |
+|---|---|---|---|
+| D. Dependencies initialized by the first requests | 103 | 4 | **76** |
+| A. Dependency only the training warm-up initialized | 108 | 23 | 28 |
+| B. Upgrade dropped (level 2 still queued) | 78 | 2 | 7 |
+| C. No top-level C2 compile in training | 170 | 14 | 27 |
+
+**D is fixed.**
+- **Most D methods now reach C2 before traffic:** 76 of 103 per run, up from 4.
+- **First-time C2 compiles in the burst fell from 94 to 26.**
+
+**A gained little.** With fix A the cache no longer records the client-class dependencies. So these methods'
+compile records changed, and many of them probably now behave like B or C. That would need the new cache's
+training-data dump to confirm.
+
+**B and C are now the bottleneck.**
+- **They account for most of the C2 work left in the burst.** That work is the 163 level 2 → C2 upgrades, which
+  depend on this run's counters, plus some remaining first-time compiles.
+- **C2 still holds about a third of the CPU for 8 s.** That's about ten times `warm`'s share.
+- **`skip-2` and `skip-3` tipped into overload anyway.** They started missing requests at +2.1 s and +0.7 s,
+  with no GC and no checker stall at that point.
+- **`skip-1` passed.** It lost 175 requests, only to the checker's stall at +4.1 s.
 
 ## 6. Projection: services with more than one endpoint
 
@@ -350,9 +419,10 @@ How many of those methods each approach gets to C2 before the endpoint's first r
     time hours later pays it then.
   - The "about none" doesn't depend on K, but the backlog grows linearly with K, and so does the window in
     which the instance has no CPU headroom.
-  - With the suggested fix for D (section 4, untested), roughly 20–40% of each endpoint's request path would
-    be compiled at startup instead. That covers every endpoint, including cold ones, because it needs only the
-    class list from training, not traffic. B and C would still leave about half for load.
+  - With eager class initialization, D's share is compiled at startup instead. That's measured here: 76 of 103
+    D methods, and about 30% fewer C2 compiles during traffic. It covers every endpoint, including cold ones,
+    because it needs no traffic.
+  - B and C, about half the gap, still wait for load.
 - **The `warm` approach, with a warm-up that exercises every endpoint: about all of them,** but the same compile
   CPU moves into startup. This service already spends about 60 s of warm-up. That grows with K, and warm-up
   traffic has to stay representative of, and isolated from, real data for every endpoint.
@@ -370,14 +440,19 @@ How many of those methods each approach gets to C2 before the endpoint's first r
 ## 7. Conclusions
 
 - On JDK 25, AOT training data plus SkipTier2IfPossible and eager compilation C2-compile startup and shared code
-  well. They can't C2-compile the request path before traffic: those compiles depend on classes that the AOT
-  cache preloads but that only requests initialize. Training size doesn't matter: 10k, 20k and 40k training
-  calls gave the same counts.
+  well. By default they can't C2-compile the request path before traffic: those compiles depend on classes that
+  the AOT cache preloads but that only requests initialize. Training size doesn't matter: 10k, 20k and 40k
+  training calls gave the same counts.
 - Of `skip`'s problems, the ones we could fix are fixed:
   - training no longer records dependencies on the warm-up client (A);
-  - an idle-period GC keeps the expensive startup GCs out of the burst.
-  B is a HotSpot policy race that could be reported upstream. D could be addressed by initializing the dependency
-  classes during the idle period (section 4; untested). C is inherent to JIT-only replay.
+  - an idle-period GC keeps the expensive startup GCs out of the burst;
+  - eager initialization of every loaded class during the idle period fixes D: 76 of 103 methods now reach C2
+    before traffic, up from 4.
+- B and C are now the bottleneck.
+  - B is a HotSpot policy race that could be reported upstream.
+  - C is inherent to JIT-only replay.
+  - Together they leave about 160 level 2 → C2 upgrades for the burst. With those, `skip` still runs short of
+    CPU headroom and failed 2 of 3 runs.
 - For this service on JDK 25, `warm` remains the reliable way to meet the SLA. For services with many endpoints,
   the `warm` approach's startup cost grows with the number of endpoints, and so does the `skip` approach's
   backlog. The way out is AOT code that can run before class initialization, which is what JEP 544's preload
@@ -388,6 +463,7 @@ How many of those methods each approach gets to C2 before the endpoint's first r
 Experiments, in the work-trial repository's `evaluations/`, which is not published:
 - jit-5s: 52 runs of `warm` and `skip`;
 - training-deps: the instrumented `skip` run, the idle-only `PrintTieredEvents` run and the training-data dump;
-- depfix-gc: fix A plus the idle-period GC, 4 runs per branch.
+- depfix-gc: fix A plus the idle-period GC, 4 runs per branch;
+- initclasses: plus eager class initialization in `skip`, 3 runs per branch.
 
 The figures are generated by `evaluations/20261119-skip-vs-warm-report/figures.py` there.
