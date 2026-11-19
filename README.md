@@ -7,6 +7,9 @@ Experiments on a Spring Boot API (JDK 25, AOT cache, 1 CPU, SerialGC) under a 2,
    and why skip sometimes collapses (inferred: the first GC at the burst onset).
 2. [`20261119-jit-5s/REPORT.md`](20261119-jit-5s/REPORT.md): 52 runs with JFR GC and deopt events. Skip's first
    two GCs (37–82 ms each) land in the burst; warm-up passes 23 of 26 runs, skip 3 of 26.
+3. [`20261119-skiptier2-vs-warmup/REPORT.md`](20261119-skiptier2-vs-warmup/REPORT.md): why skip starts traffic
+   with ~900 fewer methods at C2 than warm-up (HotSpot source and training-data analysis), a follow-up with
+   two fixes, and a projection for services with many endpoints.
 
 Each report's `graphs/` folder holds its images. Raw run data and the experiment scripts referenced in the
 reports' "Files" sections are not included in this repository.
