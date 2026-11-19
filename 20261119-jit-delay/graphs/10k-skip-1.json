@@ -1,0 +1,42 @@
+{
+ "run": "10k-skip-1",
+ "markers": {
+  "healthy": 10.8,
+  "idle_end": 80.0,
+  "burst_start": 170.5,
+  "burst_end": 180.5
+ },
+ "compilations": {
+  "idle C1": 4861,
+  "idle C2": 1464,
+  "traffic C1": 549,
+  "traffic C2": 353
+ },
+ "methods": {
+  "idle C1": 4683,
+  "idle C2": 1448,
+  "traffic C1": 529,
+  "traffic C2": 342
+ },
+ "traffic_kinds_compilations": {
+  "C1 new": 420,
+  "C1 level_raise": 114,
+  "C1 recompile": 15,
+  "C2 new": 119,
+  "C2 level_raise": 225,
+  "C2 recompile": 9
+ },
+ "traffic_kinds_methods": {
+  "C1 new": 418,
+  "C1 level_raise": 114,
+  "C1 recompile": 15,
+  "C2 new": 119,
+  "C2 level_raise": 225,
+  "C2 recompile": 8
+ },
+ "invalidated": {
+  "at_idle_end": 0,
+  "at_burst_start": 0,
+  "at_burst_end": 0
+ }
+}

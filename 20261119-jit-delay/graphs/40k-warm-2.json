@@ -1,0 +1,42 @@
+{
+ "run": "40k-warm-2",
+ "markers": {
+  "healthy": 67.7,
+  "idle_end": 77.8,
+  "burst_start": 170.3,
+  "burst_end": 180.3
+ },
+ "compilations": {
+  "idle C1": 7330,
+  "idle C2": 2463,
+  "traffic C1": 69,
+  "traffic C2": 42
+ },
+ "methods": {
+  "idle C1": 6948,
+  "idle C2": 2382,
+  "traffic C1": 65,
+  "traffic C2": 40
+ },
+ "traffic_kinds_compilations": {
+  "C1 new": 30,
+  "C1 level_raise": 25,
+  "C1 recompile": 14,
+  "C2 new": 5,
+  "C2 level_raise": 33,
+  "C2 recompile": 4
+ },
+ "traffic_kinds_methods": {
+  "C1 new": 30,
+  "C1 level_raise": 25,
+  "C1 recompile": 11,
+  "C2 new": 5,
+  "C2 level_raise": 33,
+  "C2 recompile": 4
+ },
+ "invalidated": {
+  "at_idle_end": 0,
+  "at_burst_start": 0,
+  "at_burst_end": 0
+ }
+}
