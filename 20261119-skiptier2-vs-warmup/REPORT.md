@@ -27,7 +27,9 @@ warm-up" or "the startup warm-up" means the mechanism: the self-traffic the API 
   - **C. No top-level C2 compile in training (170 methods).** Training compiled them on their own only at C1. 134
     reached C2 only inlined into callers. Eager compilation never takes these past level 2.
   - **D. Dependencies initialized by the first real requests (103 methods).** These work as designed, but only
-    once traffic has started.
+    once traffic has started. The source shows that initializing those classes is enough; the methods don't
+    need to be called until they're hot. So explicitly initializing them during the idle period should fix D
+    (section 4, untested).
 - **Preloaded is not initialized.**
   - The AOT cache loads and links every cached class at startup, including the request-path classes.
   - JIT dependencies wait for class initialization, which runs a class's static initializer at its first use.
@@ -214,6 +216,79 @@ Evidence for each cause:
   traffic, nothing initializes the request-path classes, so code that assumes they're initialized can't be
   installed.
 
+### Suggested fix for D: initialize the classes during the idle period
+
+Untested. To fix D, the dependency classes only need to be initialized; the methods don't need to be called until
+they're hot. When the last class a compile record depends on finishes initializing, HotSpot queues that C2
+compile immediately. No invocation counters are involved.
+
+**The trigger path in the source (`jdk-25-ga`):**
+1. **Initialization finishing triggers it.** At the end of class initialization, `InstanceKlass::initialize_impl`
+   calls `CompilationPolicy::replay_training_at_init(this)` (`instanceKlass.cpp:1335`). That queues the class
+   for the "Training replay thread", which runs whenever the cache has training data (`compileBroker.cpp:1033`).
+2. **The replay thread counts down dependencies and compiles what's ready.** `replay_training_at_init_impl`
+   (`compilationPolicy.cpp:139`):
+   - `notice_fully_initialized()` decrements the dependency counter of every compile record that depends on the
+     class;
+   - with `-XX:+AOTCompileEagerly` (set in both branches), it calls `maybe_compile_early(method)` for every
+     record whose counter is now 0.
+3. **`maybe_compile_early` queues the compile directly** (`:89`). It asks `trained_transition` for the next level
+   and calls `CompileBroker::compile_method(..., Reason_MustBeCompiled)` without reading invocation or loop
+   counters.
+4. **`trained_transition` returns level 4 once dependencies are met.**
+   - From the interpreter, `trained_transition_from_none` (`:1160`) does so when
+     `SkipTier2IfPossible && init_deps_left() == 0`.
+   - From level 2, `trained_transition_from_limited_profile` (`:1189`) does so when `init_deps_left() == 0`.
+   - The compile uses the profile stored in the training data, so no profiling is needed in this JVM.
+
+Only the normal counter-driven path, `common()` (`:1290`), needs the method to be called repeatedly. C methods
+depend on it.
+
+**Measured confirmation:**
+- **C2 compiles with no traffic at all.** The idle-only run with `skip`'s settings sent no requests and logged
+  1,150 `force-compile level=4` events. All were queued by this replay path while Spring's startup initialized
+  classes, within the first 20 s.
+- **The compile follows initialization almost immediately.** For methods whose dependencies were all met, the
+  median time from the last dependency's initialization to the C2 compile was 0.62 s (p10 0.34 s): queue wait,
+  not warm-up.
+- **Low traffic was enough for D.** In the instrumented `skip` run, 92 of the 103 D methods reached C2 during the
+  functional checks, at far too low a request rate to make them hot.
+
+**The proposal.** During `skip`'s idle period, after startup and before the idle-period GC, explicitly initialize
+the classes that compile records depend on, with `Class.forName(name, true, loader)`. Two ways to get the list:
+- **Targeted:** the classes the `-XX:+AOTPrintTrainingInfo` dump lists as dependencies of C2 compile records. The
+  dump can be produced from the cache at build time.
+- **Broad:** every class that was already initialized when training ended.
+
+Conditions for a method to reach C2 this way:
+1. **All of its dependencies must be initialized,** not only the obvious request classes.
+   - Dependencies include exception types and classes from type profiles; `getConnection` has 52.
+   - Some are initialized only on rare paths, such as `ClosedChannelException` and `CancelledKeyException`. One
+     request per endpoint might not cover them, but an explicit initialization list would.
+2. **The method's own class must be initialized.** `maybe_compile_early` returns early otherwise. The class is
+   normally among its own dependencies, so initializing it triggers the check again; this isn't verified for
+   every method.
+3. **No compile of the method may already be queued.** This is cause B: an upgrade that becomes possible while an
+   eager level-2 compile is still waiting is dropped.
+   - Initializing everything at once would produce many such collisions.
+   - Initializing in batches, and waiting for the compile queues to drain between batches, should avoid most of
+     them.
+   - Classes initialized during startup (before the idle period) can't be controlled this way, so some B-type
+     drops remain.
+
+**Risks:**
+- **Running static initializers early is a semantic change.** They run at a different time and in a different
+  order than the first request would run them. For framework and application classes that's usually harmless,
+  but initializers with side effects (starting threads, reading configuration, opening connections) need
+  checking.
+- **It doesn't help C** (no top-level C2 compile in training). Those methods still need to get hot, so the
+  backlog of C methods remains for traffic.
+
+**Expected effect, if it works as the source suggests.** D (103 methods) would reach C2 before traffic, and
+most of what remains of A after fix A would too, if those methods' dependencies are request-path classes. About
+20–40% of the 488-method gap would then be compiled during the idle period instead of the burst. B and C, about
+half the gap, would remain.
+
 ## 5. Follow-up: fixing A, plus a GC during the idle period
 
 Two changes, then 4 runs of each branch on a 40k cache retrained with them (experiment depfix-gc):
@@ -275,6 +350,9 @@ How many of those methods each approach gets to C2 before the endpoint's first r
     time hours later pays it then.
   - The "about none" doesn't depend on K, but the backlog grows linearly with K, and so does the window in
     which the instance has no CPU headroom.
+  - With the suggested fix for D (section 4, untested), roughly 20–40% of each endpoint's request path would
+    be compiled at startup instead. That covers every endpoint, including cold ones, because it needs only the
+    class list from training, not traffic. B and C would still leave about half for load.
 - **The `warm` approach, with a warm-up that exercises every endpoint: about all of them,** but the same compile
   CPU moves into startup. This service already spends about 60 s of warm-up. That grows with K, and warm-up
   traffic has to stay representative of, and isolated from, real data for every endpoint.
@@ -298,7 +376,8 @@ How many of those methods each approach gets to C2 before the endpoint's first r
 - Of `skip`'s problems, the ones we could fix are fixed:
   - training no longer records dependencies on the warm-up client (A);
   - an idle-period GC keeps the expensive startup GCs out of the burst.
-  B is a HotSpot policy race that could be reported upstream. C and D are inherent to JIT-only replay.
+  B is a HotSpot policy race that could be reported upstream. D could be addressed by initializing the dependency
+  classes during the idle period (section 4; untested). C is inherent to JIT-only replay.
 - For this service on JDK 25, `warm` remains the reliable way to meet the SLA. For services with many endpoints,
   the `warm` approach's startup cost grows with the number of endpoints, and so does the `skip` approach's
   backlog. The way out is AOT code that can run before class initialization, which is what JEP 544's preload
